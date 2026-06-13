@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}{{ settings.app_title }}{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { fontFamily: { sans: ['DM Sans', 'system-ui', 'sans-serif'] } } } };
+  </script>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 font-sans antialiased">
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
+    <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between gap-4">
+      <a href="/" class="text-lg font-semibold tracking-tight text-white hover:text-emerald-400 transition">{{ settings.app_title }}</a>
+      <nav class="flex items-center gap-4 text-sm text-slate-400">
+        <a href="/" class="hover:text-white transition">Runs</a>
+        <a href="/health" class="hover:text-white transition">Health</a>
+      </nav>
+    </div>
+  </header>
+  <main class="max-w-6xl mx-auto px-4 py-8">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="max-w-6xl mx-auto px-4 py-8 text-center text-xs text-slate-600">
+    View payslips here after upload: map columns, build snapshots. Same MySQL as your HR Genie tenant. Bind 127.0.0.1 only in production.
+  </footer>
+</body>
+</html>

@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} | {{ settings.app_title }}{% endblock %}
+{% block content %}
+<div class="mb-6 flex flex-wrap items-center justify-between gap-4">
+  <div>
+    <p class="text-slate-500 text-sm font-mono">Run #{{ run.id }}</p>
+    <h1 class="text-2xl font-bold text-white">Payroll month {{ run.payroll_month }}</h1>
+    <p class="text-slate-400 text-sm mt-1">{{ run.original_filename or '-' }} | SHA256 <code class="text-xs text-slate-500">{{ (run.csv_sha256 or '')[:16] }}{% if run.csv_sha256 %}...{% endif %}</code></p>
+  </div>
+  <span class="rounded-full px-3 py-1 text-sm font-medium
+    {% if run.status == 'failed' %}bg-red-950 text-red-300
+    {% elif run.status == 'snapshotted' %}bg-emerald-950 text-emerald-300
+    {% else %}bg-slate-800 text-slate-300{% endif %}">{{ run.status }}</span>
+</div>
+
+{% if run.status == 'failed' and run.error_json %}
+<div class="mb-6 rounded-xl border border-red-900 bg-red-950/40 p-4 text-red-200 text-sm">
+  <p class="font-semibold mb-2">Validation failed</p>
+  <pre class="text-xs overflow-auto">{{ run.error_json | tojson(indent=2) }}</pre>
+</div>
+{% elif run.error_json and 'import_warnings' in run.error_json %}
+<div class="mb-6 rounded-xl border border-amber-800 bg-amber-950/30 p-4 text-amber-100 text-sm">
+  <p class="font-semibold mb-2">Import notice</p>
+  <pre class="text-xs overflow-auto">{{ run.error_json | tojson(indent=2) }}</pre>
+</div>
+{% endif %}
+
+{% if request.query_params.get('replaced') %}
+<p class="mb-4 rounded-lg border border-cyan-800 bg-cyan-950/40 px-3 py-2 text-cyan-100 text-sm">
+  <strong>CSV updated</strong> — {{ request.query_params.get('replaced') }} row(s) stored. Column map was regenerated from the new file.
+  <strong class="text-white">Build snapshots</strong> again (payslip list was cleared), then <strong class="text-white">Push to Laravel</strong> if you need payroll rows refreshed.
+</p>
+{% endif %}
+{% if request.query_params.get('snapshot_post_only') %}
+<p class="mb-4 rounded-lg border border-amber-900/60 bg-amber-950/30 px-3 py-2 text-amber-200 text-sm">
+  Snapshot build runs as a <strong>POST</strong> when you click <strong>Build snapshots</strong> on this page. Opening <code class="text-xs">/runs/{{ run.id }}/snapshot</code> in the address bar only loads this page (GET).
+</p>
+{% endif %}
+{% if request.query_params.get('ai_suggest') %}
+<p class="mb-4 rounded-lg border border-indigo-800 bg-indigo-950/40 px-3 py-2 text-indigo-100 text-sm">
+  Azure OpenAI updated <strong>{{ request.query_params.get('ai_suggest') }}</strong> column map row(s). Review the table below, adjust any row, then click <strong>Save mapping</strong> before building snapshots.
+</p>
+{% endif %}
+{% if request.query_params.get('mapped') %}
+<p class="mb-4 text-emerald-400 text-sm">Column map rebuilt ({{ request.query_params.get('mapped') }} headers).</p>
+{% endif %}
+{% if request.query_params.get('saved') %}
+<p class="mb-4 text-emerald-400 text-sm">Column map saved.</p>
+{% endif %}
+{% if request.query_params.get('snapshots') %}
+<p class="mb-4 text-emerald-400 text-sm">Snapshots built: {{ request.query_params.get('snapshots') }} employees.</p>
+{% endif %}
+{% if request.query_params.get('pushed') %}
+<div class="mb-4 rounded-lg border border-emerald-800 bg-emerald-950/40 px-3 py-2 text-emerald-100 text-sm">
+  Saved <strong>{{ request.query_params.get('pushed') }}</strong> payroll row(s) (insert or update by employee + month).
+  Filter: <code class="text-xs text-slate-300">{{ request.query_params.get('filter_used', '') }}</code>.
+  Companion <strong>salary_arrears</strong> rows are upserted when that table exists.
+  In HR Genie open <strong>Payroll</strong> and select this month.
+  {% if request.query_params.get('integrity') %}
+  <p class="mt-2 text-amber-200/90 text-xs">Integrity: {{ request.query_params.get('integrity') }}</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<section id="payslips" class="mb-8 rounded-2xl border border-emerald-900/50 bg-emerald-950/20 p-6 scroll-mt-24">
+  <h2 class="text-lg font-semibold text-white mb-2">Payslips <span class="text-emerald-400 font-normal">({{ snap_count }})</span></h2>
+  {% if snap_count > 0 %}
+  <p class="text-slate-400 text-sm mb-4">Figures are taken from your CSV snapshot only. Click an employee, then use the browser <strong class="text-slate-300">Print</strong> dialog to save as PDF.</p>
+  <ul class="grid sm:grid-cols-2 lg:grid-cols-3 gap-2 text-sm">
+    {% for p in previews %}
+    <li>
+      <a href="/runs/{{ run.id }}/preview/{{ p.employee_id }}" class="block rounded-lg border border-emerald-800/60 bg-slate-900/60 px-3 py-2 hover:border-emerald-500 hover:bg-slate-900 transition">
+        <span class="font-mono text-emerald-400">{{ p.payroll_number }}</span>
+        <span class="text-slate-400 block text-xs">{{ p.first_name }} {{ p.last_name }}</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="text-slate-500 text-sm">No payslips yet. After upload, adjust column mapping if needed, then click <strong class="text-slate-400">Build snapshots</strong> below; payslips will appear here.</p>
+  {% endif %}
+  {% if snap_count > 0 %}
+  <form action="/runs/{{ run.id }}/push-to-laravel-payroll" method="post" class="mt-4" onsubmit="return confirm('Upsert payrolls + salary_arrears for this run? Skips employees with finalized payroll for this month. Existing unfinalized rows are updated.');">
+    <button type="submit" class="rounded-lg bg-indigo-700 hover:bg-indigo-600 border border-indigo-500 px-4 py-2 text-sm font-semibold text-white">
+      Push to Laravel /payroll (payrolls table)
+    </button>
+    <p class="text-slate-500 text-xs mt-2 max-w-xl">For each employee in this file: if a <code class="text-xs text-slate-400">payrolls</code> row already exists for the same <strong class="text-slate-400">payroll_date</strong> (month end) and employee (from payroll number), it is <strong class="text-slate-400">updated</strong>; otherwise a new row is inserted. Duplicate rows for the same employee + month are removed (oldest id kept). Refreshes <strong class="text-slate-400">krap9</strong> (KRA P9) per employee for that month.</p>
+  </form>
+  {% endif %}
+</section>
+
+<div class="mb-8 rounded-2xl border border-cyan-900/50 bg-cyan-950/20 p-6">
+  <h2 class="text-lg font-semibold text-white mb-1">Update CSV (same month)</h2>
+  <p class="text-slate-400 text-sm mb-4 max-w-2xl">Replace the file for this run without creating a new import. Snapshots are cleared so figures stay in sync — use <strong class="text-slate-300">Build snapshots</strong> afterward.</p>
+  <form action="/runs/{{ run.id }}/replace-csv" method="post" enctype="multipart/form-data" class="flex flex-wrap items-end gap-3" onsubmit="return confirm('Replace stored CSV and clear payslip snapshots for this run?');">
+    <div>
+      <label class="block text-xs font-medium text-slate-400 mb-1">New CSV</label>
+      <input type="file" name="file" accept=".csv,text/csv" required class="block w-full max-w-md text-sm text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-cyan-700 file:text-white hover:file:bg-cyan-600" />
+    </div>
+    <button type="submit" class="rounded-lg bg-cyan-700 hover:bg-cyan-600 border border-cyan-500 px-4 py-2 text-sm font-semibold text-white">Replace CSV</button>
+  </form>
+</div>
+
+{% if run.status != 'failed' and run.row_count %}
+<div class="flex flex-wrap gap-3 mb-8">
+  <form action="/runs/{{ run.id }}/map/rebuild" method="post">
+    <button type="submit" class="rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 px-4 py-2 text-sm font-medium">Rebuild column map</button>
+  </form>
+  {% if ai_suggest_enabled %}
+  <form action="/runs/{{ run.id }}/map/ai-suggest" method="post" onsubmit="return confirm('Call Azure OpenAI to suggest roles for all columns? This overwrites current roles (you can still edit before Save).');">
+    <button type="submit" class="rounded-lg bg-violet-700 hover:bg-violet-600 border border-violet-500 px-4 py-2 text-sm font-semibold text-white">
+      AI suggest columns (Azure)
+    </button>
+  </form>
+  {% else %}
+  <p class="text-slate-500 text-xs self-center max-w-md">Set <code class="text-slate-400">AZURE_OPENAI_API_KEY</code>, <code class="text-slate-400">AZURE_OPENAI_ENDPOINT</code>, and <code class="text-slate-400">AZURE_OPENAI_DEPLOYMENT_NAME</code> in <code class="text-slate-400">.env</code> to enable AI column suggestions.</p>
+  {% endif %}
+  <form action="/runs/{{ run.id }}/snapshot" method="post" class="flex flex-wrap items-end gap-4">
+    <div class="flex flex-col gap-1 max-w-sm">
+      <label for="personal_relief_kes" class="text-xs font-medium text-slate-400">Personal relief (KES / employee)</label>
+      <input id="personal_relief_kes" type="number" name="personal_relief_kes" value="{{ personal_relief_default }}" min="0" step="0.01" class="w-36 rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm text-white focus:ring-2 focus:ring-emerald-500 outline-none" />
+      <p class="text-[11px] text-slate-500 leading-snug">Applied to every snapshot for P9, PAYE, and <code class="text-slate-400">krap9</code>, even when the CSV has no relief column. Default 2400 / month (Kenya). Overrides merged CSV personal relief for this build; use <strong class="text-slate-400">0</strong> if none.</p>
+    </div>
+    <button type="submit" class="rounded-lg bg-emerald-700 hover:bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shrink-0">Build snapshots</button>
+  </form>
+</div>
+<section class="mb-10 rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
+  <h2 class="text-lg font-semibold text-white mb-4">Column mapping</h2>
+  <p class="text-slate-500 text-sm mb-4">Adjust role and optional allowance/deduction IDs, then save. Use <strong class="text-slate-300">Rebuild</strong> for heuristics, or <strong class="text-slate-300">AI suggest</strong> (Azure) for intelligent classification against your master lists. Statutory totals should stay <code>computed</code> unless you intentionally map them as earnings.</p>
+  <p class="text-amber-200/90 text-xs mb-4 border border-amber-900/50 rounded-lg px-3 py-2 bg-amber-950/20">Payslips and Laravel push follow the <strong>CSV snapshot</strong>. NSSF Tier I / II amounts are taken from the file when present; otherwise they are derived from your tenant NSSF slabs (6% + 6%, same logic as HR Genie payroll), or the standard payslip fallback if slabs are unavailable.</p>
+  <form action="/runs/{{ run.id }}/map/save" method="post" class="space-y-2">
+    <div class="overflow-x-auto max-h-[480px] overflow-y-auto rounded-lg border border-slate-800">
+      <table class="w-full text-xs">
+        <thead class="bg-slate-900 text-slate-400 sticky top-0">
+          <tr>
+            <th class="text-left px-2 py-2">Header</th>
+            <th class="text-left px-2 py-2">Role</th>
+            <th class="text-left px-2 py-2">Allowance</th>
+            <th class="text-left px-2 py-2">Deduction</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-800">
+          {% for m in maps %}
+          <tr class="hover:bg-slate-800/40">
+            <td class="px-2 py-1.5 font-mono text-slate-300 max-w-[200px] truncate" title="{{ m.csv_header_normalized }}">{{ m.csv_header_raw }}</td>
+            <td class="px-2 py-1.5">
+              <select name="m_{{ m.id }}_role" class="w-full rounded bg-slate-800 border border-slate-700 text-slate-200">
+                {% for r in ['dimension','computed','earning','deduction','ignore'] %}
+                <option value="{{ r }}" {% if m.role == r %}selected{% endif %}>{{ r }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td class="px-2 py-1.5">
+              <select name="m_{{ m.id }}_allowance_id" class="w-full max-w-[140px] rounded bg-slate-800 border border-slate-700 text-slate-200">
+                <option value="">-</option>
+                {% for a in allowances %}
+                <option value="{{ a.id }}" {% if m.allowance_id == a.id %}selected{% endif %}>{{ a.name }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td class="px-2 py-1.5">
+              <select name="m_{{ m.id }}_deduction_id" class="w-full max-w-[140px] rounded bg-slate-800 border border-slate-700 text-slate-200">
+                <option value="">-</option>
+                {% for d in deductions %}
+                <option value="{{ d.id }}" {% if m.deduction_id == d.id %}selected{% endif %}>{{ d.name }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <button type="submit" class="mt-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-sm font-semibold text-white">Save mapping</button>
+  </form>
+</section>
+{% endif %}
+
+<p class="mt-8"><a href="/" class="text-slate-500 hover:text-white text-sm">← Back</a></p>
+{% endblock %}

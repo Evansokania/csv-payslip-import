@@ -1,0 +1,2 @@
+# Optional: build a Windows .exe (see README "Shareable Windows build").
+pyinstaller>=6.0

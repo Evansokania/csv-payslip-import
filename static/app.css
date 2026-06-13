@@ -1,0 +1,4 @@
+/* Small tweaks on top of Tailwind */
+.payslip-print {
+  print-color-adjust: exact;
+}

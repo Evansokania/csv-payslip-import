@@ -1,0 +1,14 @@
+# Laragon / local tenant database (same DB Laravel tenancy uses for one client)
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=
+MYSQL_DATABASE=tenant_prl_your_tenant_id
+
+# Optional: SQLAlchemy URL overrides discrete vars
+# DATABASE_URL=mysql+pymysql://root:@127.0.0.1:3306/tenant_prl_xxx?charset=utf8mb4
+
+APP_TITLE=CSV Payslip Import
+# Bind dev server (use 127.0.0.1 only)
+HOST=127.0.0.1
+PORT=8890
