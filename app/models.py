@@ -145,6 +145,31 @@ class PayrollImportSynonym(Base):
     )
 
 
+class PayrollImportClassification(Base):
+    """Wage-type classification (from the tenant's classification sheet).
+
+    Drives import column routing: header -> section (Earning / Statutory Deduction /
+    Other Deduction / Memo / Calculated) so memo/calculated columns are excluded and
+    earnings/deductions route correctly regardless of banner layout.
+    """
+
+    __tablename__ = "payroll_import_classifications"
+    __table_args__ = (
+        UniqueConstraint("normalized_header", name="prl_imp_classif_hdr_uq"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    normalized_header: Mapped[str] = mapped_column(String(512))
+    raw_header: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    section: Mapped[str] = mapped_column(String(64))
+    nature: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Allowance(Base):
     __tablename__ = "allowances"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

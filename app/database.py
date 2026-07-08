@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import get_settings
 from app.models import (
     Base,
+    PayrollImportClassification,
     PayrollImportColumnMap,
     PayrollImportRawRow,
     PayrollImportRun,
@@ -27,6 +28,7 @@ _PAYROLL_IMPORT_TABLES = (
     PayrollImportRawRow.__table__,
     PayrollImportColumnMap.__table__,
     PayrollImportSnapshot.__table__,
+    PayrollImportClassification.__table__,
 )
 
 
@@ -128,3 +130,9 @@ def dispose_engine() -> None:
         _engine.dispose()
     _engine = None
     _SessionLocal = None
+    try:
+        from app.payroll_integrity import clear_table_cache
+
+        clear_table_cache()
+    except Exception:
+        pass

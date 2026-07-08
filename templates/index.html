@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="mb-10">
-  <h1 class="text-3xl font-bold text-white mb-2">Import payroll CSV</h1>
+  <h1 class="text-3xl font-bold text-white mb-2">Import payroll CSV / Excel</h1>
   <p class="text-slate-400 max-w-2xl mb-6">Upload a wide payroll export. Rows are stored as JSON; <strong class="text-emerald-400">payslips below</strong> use CSV amounts only (same snapshot written to your tenant MySQL). After <strong class="text-slate-300">Build snapshots</strong>, use <strong class="text-slate-300">Push to Laravel /payroll</strong> on the run page to insert into <code class="text-xs text-slate-500">payrolls</code> so HR Genie's Payroll screen lists them. Import tables are created automatically on first use if missing.</p>
   <div class="rounded-2xl border border-slate-800 bg-slate-900/50 p-6 shadow-xl shadow-black/40">
     <form action="/runs/upload" method="post" enctype="multipart/form-data" class="space-y-4">
@@ -11,8 +11,9 @@
         <p class="text-xs text-slate-500 mt-1">Uses last day of month in database.</p>
       </div>
       <div>
-        <label class="block text-sm font-medium text-slate-300 mb-1">CSV file</label>
-        <input type="file" name="file" accept=".csv,text/csv" required class="block w-full text-sm text-slate-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-emerald-600 file:text-white hover:file:bg-emerald-500" />
+        <label class="block text-sm font-medium text-slate-300 mb-1">CSV or Excel (.xlsx) file</label>
+        <input type="file" name="file" accept=".csv,text/csv,.xlsx,.xlsm,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required class="block w-full text-sm text-slate-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-emerald-600 file:text-white hover:file:bg-emerald-500" />
+        <p class="text-xs text-slate-500 mt-1">Excel with a category banner row above the headers and a trailing TOTAL row is handled automatically.</p>
       </div>
       <button type="submit" class="rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-5 py-2.5 transition">Upload &amp; parse</button>
     </form>

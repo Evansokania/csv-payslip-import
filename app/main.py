@@ -431,6 +431,11 @@ def payslip_preview(request: Request, run_id: int, employee_id: int, db: Session
         {"id": employee_id},
     ).mappings().first()
     company = db.execute(text("SELECT * FROM company_profiles ORDER BY id ASC LIMIT 1")).mappings().first()
+
+    # Compute the same payslip object that Push writes to `payrolls.payslip` and that
+    # HR Genie's native blade renders, so the preview reflects the *accurate* payslip.
+    payslip = _computed_payslip_for_preview(db, run=run, snap=snap, employee_id=employee_id)
+
     return templates.TemplateResponse(
         request,
         "payslip.html",
@@ -440,8 +445,70 @@ def payslip_preview(request: Request, run_id: int, employee_id: int, db: Session
             "snap": snap,
             "employee": emp,
             "company": company,
+            "payslip": payslip,
         },
     )
+
+
+def _computed_payslip_for_preview(db: Session, *, run, snap, employee_id: int) -> dict | None:
+    """Build the payslip object (native shape) for a snapshot; None if it can't be built.
+
+    ``col_names_lower`` is empty because only the payslip JSON is needed here (it does
+    not depend on the `payrolls` scalar columns), so no table reflection is required.
+    """
+    import json
+    from datetime import datetime
+
+    from app.payroll_format import _filter_value
+    from app.payroll_integrity import fetch_employee_for_payroll, has_table, reflect_payrolls_table
+    from app.payroll_record_builder import build_payroll_record, fetch_prescribed_rate
+
+    try:
+        emp_full = fetch_employee_for_payroll(db, int(employee_id))
+        if not emp_full:
+            return None
+        payroll_date = run.payroll_month
+        if isinstance(payroll_date, datetime):
+            payroll_date = payroll_date.date()
+        # Reflect the real payrolls columns so the payslip matches Push exactly; always
+        # include "payslip" so the object is emitted even on a minimal schema.
+        col_names_lower = {"payslip"}
+        try:
+            if has_table(db, "payrolls"):
+                _, col_map = reflect_payrolls_table(db)
+                col_names_lower |= set(col_map.keys())
+        except Exception:
+            pass
+        payload = build_payroll_record(
+            db,
+            snap=snap,
+            employee=emp_full,
+            payroll_date=payroll_date,
+            filter_label=_filter_value(run.id),
+            prescribed_rate=fetch_prescribed_rate(db),
+            now=datetime.utcnow(),
+            col_names_lower=col_names_lower,
+        )
+        ps = json.loads(payload["payslip"])
+        for key in ("allowances", "untaxable", "deductions", "paye", "nssf"):
+            val = ps.get(key)
+            if isinstance(val, str):
+                try:
+                    ps[key] = json.loads(val)
+                except json.JSONDecodeError:
+                    ps[key] = []
+        # Expand any per-master detailed breakdowns (e.g. overtime OT1/OT2).
+        for a in ps.get("allowances") or []:
+            det = a.get("detailed") if isinstance(a, dict) else None
+            if isinstance(det, str):
+                try:
+                    a["detailed"] = json.loads(det)
+                except json.JSONDecodeError:
+                    a["detailed"] = None
+        return ps
+    except Exception:
+        logger.exception("payslip preview computation failed")
+        return None
 
 
 def main():

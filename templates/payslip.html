@@ -1,11 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Payslip | {{ settings.app_title }}{% endblock %}
+{% macro money(v) %}{{ '{:,.2f}'.format(v | default(0) | float) }}{% endmacro %}
 {% block content %}
 <div class="max-w-3xl mx-auto">
   <div class="mb-6 flex justify-between items-start gap-4">
     <div>
-      <p class="text-slate-500 text-sm">CSV import run #{{ run.id }} | {{ run.payroll_month }}</p>
+      <p class="text-slate-500 text-sm">CSV import run #{{ run.id }} &middot; {{ run.payroll_month }}</p>
       <h1 class="text-2xl font-bold text-white">Payslip preview</h1>
+      {% if payslip %}
+      <p class="text-emerald-400/80 text-xs mt-1">Computed payslip — identical to what <strong>Push to Laravel</strong> writes and HR Genie renders.</p>
+      {% else %}
+      <p class="text-amber-400 text-xs mt-1">Could not compute the payslip; showing raw CSV snapshot below.</p>
+      {% endif %}
     </div>
     <button type="button" onclick="window.print()" class="rounded-lg bg-slate-800 border border-slate-600 px-3 py-1.5 text-sm hover:bg-slate-700">Print</button>
   </div>
@@ -20,6 +26,7 @@
         <div class="text-slate-400 text-sm">{{ company.city if company else '' }}</div>
       </div>
     </div>
+
     <div class="p-6 space-y-4 text-sm">
       <div class="grid grid-cols-2 gap-2 border-b border-slate-200 pb-4">
         <div><span class="text-slate-500">Employee</span><br /><strong>{{ employee.first_name or '' }} {{ employee.last_name or '' }}</strong></div>
@@ -28,73 +35,121 @@
         <div><span class="text-slate-500">{{ employee.identification_type or 'ID' }}</span><br />{{ employee.identification_number }}</div>
         {% endif %}
         <div><span class="text-slate-500">KRA PIN</span><br />{{ employee.kra_pin or '-' }}</div>
+        {% if payslip and payslip.date %}<div class="col-span-2"><span class="text-slate-500">Period</span><br />{{ payslip.date }}</div>{% endif %}
       </div>
 
-      {% if snap.dimensions %}
-      <h3 class="font-semibold text-slate-800 border-b pb-1">From CSV <span class="text-slate-400 font-normal">(dimensions)</span></h3>
-      <table class="w-full text-sm mb-4">
+      {% if payslip %}
+      {# ---- Earnings ---- #}
+      <table class="w-full">
+        <thead><tr class="text-left border-b border-slate-300"><th class="py-1 font-semibold text-slate-700">Earnings</th><th class="text-right font-semibold text-slate-700">Amount</th></tr></thead>
         <tbody>
-          {% for k, v in snap.dimensions.items() %}
+          <tr class="border-b border-slate-100"><td class="py-1">Basic Pay</td><td class="py-1 text-right font-mono">{{ money(payslip.basic_pay) }}</td></tr>
+          {% for a in payslip.allowances %}
+            {% if a.show %}
+              {% if a.detailed %}
+                {% for d in a.detailed %}
+                <tr class="border-b border-slate-100"><td class="py-1 pl-3">{{ d.name }}</td><td class="py-1 text-right font-mono">{{ money(d.amount) }}</td></tr>
+                {% endfor %}
+              {% else %}
+                <tr class="border-b border-slate-100"><td class="py-1">{{ a.name }}</td><td class="py-1 text-right font-mono">{% if a.included_in_basic_pay %}({{ money(a.amount) }}){% else %}{{ money(a.amount) }}{% endif %}</td></tr>
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          <tr class="border-t-2 border-slate-300 font-semibold"><td class="py-1">Gross Pay</td><td class="py-1 text-right font-mono">{{ money(payslip.gross_pay) }}</td></tr>
+        </tbody>
+      </table>
+
+      {# ---- Pre-tax / statutory (reduce taxable) ---- #}
+      {% if payslip.untaxable %}
+      <table class="w-full">
+        <thead><tr class="text-left border-b border-slate-300"><th class="py-1 font-semibold text-slate-700">Statutory / pre-tax</th><th class="text-right font-semibold text-slate-700">Relief</th></tr></thead>
+        <tbody>
+          {% for u in payslip.untaxable %}
           <tr class="border-b border-slate-100">
-            <td class="py-1 text-slate-600">{{ k }}</td>
-            <td class="py-1 text-right">{{ v }}</td>
+            <td class="py-1">{{ u.name }}</td>
+            <td class="py-1 text-right font-mono">
+              {% if u.add %}{{ money(u.deducted_amount if u.deducted_amount is defined else u.amount) }}{% else %}({{ money(u.deducted_amount if u.deducted_amount is defined else u.amount) }}){% endif %}
+            </td>
           </tr>
           {% endfor %}
+          <tr class="border-t-2 border-slate-300 font-semibold"><td class="py-1">Taxable Pay</td><td class="py-1 text-right font-mono">{{ money(payslip.taxable_pay) }}</td></tr>
         </tbody>
       </table>
       {% endif %}
 
-      <h3 class="font-semibold text-slate-800 border-b pb-1">Earnings <span class="text-slate-400 font-normal">(from CSV)</span></h3>
+      {# ---- Deductions ---- #}
       <table class="w-full">
+        <thead><tr class="text-left border-b border-slate-300"><th class="py-1 font-semibold text-slate-700">Deductions</th><th class="text-right font-semibold text-slate-700">Amount</th></tr></thead>
         <tbody>
-          {% for line in snap.earnings_lines %}
-          <tr class="border-b border-slate-100">
-            <td class="py-1">{{ line.label }}</td>
-            <td class="py-1 text-right font-mono">{{ '%.2f' % (line.amount | float) }}</td>
-          </tr>
-          {% else %}
-          <tr><td colspan="2" class="text-slate-400 py-2">No earning lines</td></tr>
+          {% set paye = payslip.paye %}
+          {% if paye %}
+          <tr class="border-b border-slate-100"><td class="py-1">PAYE</td><td class="py-1 text-right font-mono">{{ money(paye.raw_amount) }}</td></tr>
+          {% for r in paye.relief or [] %}
+          <tr class="border-b border-slate-100"><td class="py-1 pl-3 text-slate-600">{{ r.name }}</td><td class="py-1 text-right font-mono">({{ money(r.amount) }})</td></tr>
           {% endfor %}
+          <tr class="border-b border-slate-200 font-semibold"><td class="py-1">PAYE Due</td><td class="py-1 text-right font-mono">{{ money(payslip.paye_due) }}</td></tr>
+          {% endif %}
+          {% set nssf = payslip.nssf %}
+          {% if nssf and (nssf.amount | default(0) | float) > 0 %}
+          <tr class="border-b border-slate-100"><td class="py-1">NSSF{% if nssf.tier_1 is defined %} <span class="text-slate-400 text-xs">(T1 {{ money(nssf.tier_1) }} / T2 {{ money(nssf.tier_2) }})</span>{% endif %}</td><td class="py-1 text-right font-mono">{{ money(nssf.amount) }}</td></tr>
+          {% endif %}
+          {% for d in payslip.deductions %}
+            {% if d.name != 'NSSF' %}
+            <tr class="border-b border-slate-100"><td class="py-1">{{ d.name }}</td><td class="py-1 text-right font-mono">{% if d.amount is mapping %}{{ money(d.amount.amount) }}{% else %}{{ money(d.amount) }}{% endif %}</td></tr>
+              {% if d.relief and d.relief.name not in ('Personal Relief','AHL Relief','SHIF Relief') %}
+              <tr class="border-b border-slate-100"><td class="py-1 pl-3 text-slate-600">{{ d.relief.name }}</td><td class="py-1 text-right font-mono">({{ money(d.relief.amount) }})</td></tr>
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          <tr class="border-t-2 border-slate-300 font-semibold"><td class="py-1">Total Deductions</td><td class="py-1 text-right font-mono">{{ money(payslip.total_deductions) }}</td></tr>
         </tbody>
       </table>
 
-      <h3 class="font-semibold text-slate-800 border-b pb-1">Deductions <span class="text-slate-400 font-normal">(from CSV)</span></h3>
-      <table class="w-full">
+      {# ---- Summary ---- #}
+      <table class="w-full bg-slate-50 rounded-lg">
         <tbody>
-          {% for line in snap.deduction_lines %}
-          <tr class="border-b border-slate-100">
-            <td class="py-1">{{ line.label }}</td>
-            <td class="py-1 text-right font-mono">{{ '%.2f' % (line.amount | float) }}</td>
-          </tr>
-          {% else %}
-          <tr><td colspan="2" class="text-slate-400 py-2">No deduction lines</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
-
-      {% if snap.computed %}
-      <h3 class="font-semibold text-slate-800 border-b pb-1">Totals <span class="text-slate-400 font-normal">(from CSV)</span></h3>
-      <table class="w-full">
-        <tbody>
-          {% for k, v in snap.computed.items() %}
-          <tr class="border-b border-slate-100">
-            <td class="py-1">{{ k }}</td>
-            <td class="py-1 text-right font-mono">{{ '%.2f' % (v | float) }}</td>
-          </tr>
-          {% endfor %}
+          <tr><td class="py-1 px-2">Gross Pay</td><td class="py-1 px-2 text-right font-mono">{{ money(payslip.gross_pay) }}</td></tr>
+          <tr><td class="py-1 px-2">Total Deductions</td><td class="py-1 px-2 text-right font-mono">{{ money(payslip.total_deductions) }}</td></tr>
+          <tr class="text-base font-bold border-t border-slate-300"><td class="py-2 px-2">Net Pay</td><td class="py-2 px-2 text-right font-mono">{{ money(payslip.net_pay) }}</td></tr>
         </tbody>
       </table>
       {% endif %}
 
-      <p class="text-xs text-slate-500 pt-4">Source: CSV import snapshot (not generated by Laravel payroll engine).</p>
+      {# ---- CSV source (always available for verification) ---- #}
+      <details class="pt-2"{% if not payslip %} open{% endif %}>
+        <summary class="cursor-pointer text-slate-500 text-xs font-semibold">CSV source lines (snapshot)</summary>
+        <div class="mt-2 space-y-3">
+          {% if snap.dimensions %}
+          <div>
+            <div class="text-xs font-semibold text-slate-600 mb-1">Dimensions</div>
+            <table class="w-full text-xs">{% for k, v in snap.dimensions.items() %}<tr class="border-b border-slate-100"><td class="py-0.5 text-slate-600">{{ k }}</td><td class="py-0.5 text-right">{{ v }}</td></tr>{% endfor %}</table>
+          </div>
+          {% endif %}
+          <div>
+            <div class="text-xs font-semibold text-slate-600 mb-1">Earnings</div>
+            <table class="w-full text-xs">{% for line in snap.earnings_lines %}<tr class="border-b border-slate-100"><td class="py-0.5">{{ line.label }}</td><td class="py-0.5 text-right font-mono">{{ money(line.amount) }}</td></tr>{% else %}<tr><td class="text-slate-400 py-1">None</td></tr>{% endfor %}</table>
+          </div>
+          <div>
+            <div class="text-xs font-semibold text-slate-600 mb-1">Deductions</div>
+            <table class="w-full text-xs">{% for line in snap.deduction_lines %}<tr class="border-b border-slate-100"><td class="py-0.5">{{ line.label }}</td><td class="py-0.5 text-right font-mono">{{ money(line.amount) }}</td></tr>{% else %}<tr><td class="text-slate-400 py-1">None</td></tr>{% endfor %}</table>
+          </div>
+          {% if snap.computed %}
+          <div>
+            <div class="text-xs font-semibold text-slate-600 mb-1">Totals</div>
+            <table class="w-full text-xs">{% for k, v in snap.computed.items() %}<tr class="border-b border-slate-100"><td class="py-0.5">{{ k }}</td><td class="py-0.5 text-right font-mono">{{ money(v) }}</td></tr>{% endfor %}</table>
+          </div>
+          {% endif %}
+        </div>
+      </details>
     </div>
   </article>
 
-  <p class="mt-6"><a href="/runs/{{ run.id }}" class="text-emerald-500 hover:underline text-sm">← Run detail</a></p>
+  <p class="mt-6"><a href="/runs/{{ run.id }}" class="text-emerald-500 hover:underline text-sm">&larr; Run detail</a></p>
 </div>
 <style media="print">
   body { background: white !important; color: black !important; }
   header, footer, .payslip-print ~ p { display: none !important; }
   main { padding: 0 !important; max-width: none !important; }
+  details { display: none !important; }
 </style>
 {% endblock %}

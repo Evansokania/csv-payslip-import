@@ -34,11 +34,173 @@ class PushIntegrityReport:
     salary_arrears_skipped_has_payments: int = 0
 
 
+# Table existence is stable for an engine's lifetime; ``has_table`` was previously
+# hitting information_schema on every call (~7x per employee during a push).
+_TABLE_CACHE: dict[int, set[str]] = {}
+
+
+def _table_set(session: Session) -> set[str]:
+    engine = session.get_bind()
+    key = id(engine)
+    cached = _TABLE_CACHE.get(key)
+    if cached is None:
+        try:
+            cached = {t.lower() for t in inspect(engine).get_table_names()}
+        except Exception:
+            cached = set()
+        _TABLE_CACHE[key] = cached
+    return cached
+
+
+def clear_table_cache() -> None:
+    _TABLE_CACHE.clear()
+
+
 def has_table(session: Session, name: str) -> bool:
-    try:
-        return inspect(session.get_bind()).has_table(name)
-    except Exception:
-        return False
+    return name.lower() in _table_set(session)
+
+
+def _expand(ids: list[int]):
+    return bindparam("ids", expanding=True), [int(i) for i in ids]
+
+
+def fetch_employees_for_payroll(session: Session, employee_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Batch equivalent of :func:`fetch_employee_for_payroll` — 3 queries total, not 3 per row."""
+    ids = sorted({int(i) for i in employee_ids if i is not None})
+    if not ids or not has_table(session, "employees"):
+        return {}
+    param, values = _expand(ids)
+    out: dict[int, dict[str, Any]] = {}
+    rows = session.execute(
+        text(
+            """
+            SELECT id, first_name, last_name, payroll_number, identification_type,
+                   identification_number, kra_pin, hr_subdept_id,
+                   retirement_contribution, mortgage_relief, relief
+            FROM employees WHERE id IN :ids AND deleted_at IS NULL
+            """
+        ).bindparams(param),
+        {"ids": values},
+    ).mappings().all()
+    for r in rows:
+        emp = dict(r)
+        emp["retirement_contribution"] = float(emp.get("retirement_contribution") or 0)
+        emp["mortgage_relief"] = float(emp.get("mortgage_relief") or 0)
+        emp["employee_relief"] = float(emp.get("relief") or 0)
+        emp["department_id"] = None
+        emp["beneficiary_name"] = ""
+        out[int(emp["id"])] = emp
+
+    if has_table(session, "assignments") and has_table(session, "departments"):
+        param, values = _expand(ids)
+        drows = session.execute(
+            text(
+                """
+                SELECT a.employee_id AS eid, MIN(a.department_id) AS did
+                FROM assignments a INNER JOIN departments d ON d.id = a.department_id
+                WHERE a.employee_id IN :ids GROUP BY a.employee_id
+                """
+            ).bindparams(param),
+            {"ids": values},
+        ).mappings().all()
+        for r in drows:
+            e = out.get(int(r["eid"]))
+            if e is not None and r["did"] is not None:
+                e["department_id"] = int(r["did"])
+    for e in out.values():
+        if e.get("department_id") is None and e.get("hr_subdept_id"):
+            try:
+                e["department_id"] = int(e["hr_subdept_id"])
+            except (TypeError, ValueError):
+                e["department_id"] = None
+
+    if has_table(session, "employee_payment_methods"):
+        param, values = _expand(ids)
+        brows = session.execute(
+            text(
+                """
+                SELECT employee_id, beneficiary_name
+                FROM employee_payment_methods
+                WHERE employee_id IN :ids AND beneficiary_name IS NOT NULL AND beneficiary_name != ''
+                ORDER BY employee_id, id
+                """
+            ).bindparams(param),
+            {"ids": values},
+        ).mappings().all()
+        seen: set[int] = set()
+        for r in brows:
+            eid = int(r["employee_id"])
+            if eid in seen:
+                continue
+            seen.add(eid)
+            e = out.get(eid)
+            if e is not None:
+                e["beneficiary_name"] = str(r["beneficiary_name"]).strip()
+    return out
+
+
+def load_payroll_states(
+    session: Session, employee_ids: list[int], payroll_date: date
+) -> dict[int, PayrollRowState]:
+    """Batch equivalent of :func:`load_payroll_row_state` — one query for all employees."""
+    states: dict[int, PayrollRowState] = {int(i): PayrollRowState() for i in employee_ids}
+    ids = sorted({int(i) for i in employee_ids if i is not None})
+    if not ids or not has_table(session, "payrolls"):
+        return states
+    param, values = _expand(ids)
+    rows = session.execute(
+        text(
+            "SELECT id, employee_id, finalized FROM payrolls "
+            "WHERE payroll_date = :pd AND employee_id IN :ids ORDER BY employee_id, id"
+        ).bindparams(param),
+        {"pd": payroll_date, "ids": values},
+    ).mappings().all()
+    for r in rows:
+        st = states.setdefault(int(r["employee_id"]), PayrollRowState())
+        st.ids.append(int(r["id"]))
+        if r.get("finalized") in (1, True, "1"):
+            st.any_finalized = True
+    for st in states.values():
+        if st.ids:
+            st.keep_id = st.ids[0]
+    return states
+
+
+def load_salary_arrears_states(
+    session: Session, employee_ids: list[int], payroll_date: date
+) -> dict[int, dict[str, Any]]:
+    """First existing ``salary_arrears`` row per employee for the month (one query)."""
+    out: dict[int, dict[str, Any]] = {}
+    ids = sorted({int(i) for i in employee_ids if i is not None})
+    if not ids or not has_table(session, "salary_arrears"):
+        return out
+    param, values = _expand(ids)
+    rows = session.execute(
+        text(
+            "SELECT id, employee_id, paid_amount, balance, finalized FROM salary_arrears "
+            "WHERE payroll_date = :pd AND employee_id IN :ids ORDER BY employee_id, id"
+        ).bindparams(param),
+        {"pd": payroll_date, "ids": values},
+    ).mappings().all()
+    for r in rows:
+        eid = int(r["employee_id"])
+        if eid not in out:
+            out[eid] = dict(r)
+    return out
+
+
+def salary_arrears_ids_with_payments(session: Session, arrears_ids: list[int]) -> set[int]:
+    ids = sorted({int(i) for i in arrears_ids if i is not None})
+    if not ids or not has_table(session, "salary_arrears_payments"):
+        return set()
+    param, values = _expand(ids)
+    rows = session.execute(
+        text(
+            "SELECT DISTINCT salary_arrears_id FROM salary_arrears_payments WHERE salary_arrears_id IN :ids"
+        ).bindparams(param),
+        {"ids": values},
+    ).all()
+    return {int(r[0]) for r in rows}
 
 
 def fetch_employee_for_payroll(session: Session, employee_id: int) -> dict[str, Any] | None:
@@ -195,8 +357,9 @@ def upsert_payroll_row(
     payload: dict[str, Any],
     state: PayrollRowState,
     now: datetime,
+    return_id: bool = True,
 ) -> int | None:
-    """Insert or update one payroll row. Returns payroll id."""
+    """Insert or update one payroll row. Returns payroll id (skipped when ``return_id`` is False)."""
     row = filter_payload_to_table(payload, col_map)
     if state.keep_id:
         upd = dict(row)
@@ -210,6 +373,8 @@ def upsert_payroll_row(
         session.execute(update(payrolls_table).where(payrolls_table.c.id == state.keep_id).values(**upd))
         return state.keep_id
     session.execute(insert(payrolls_table).values(**row))
+    if not return_id:
+        return None
     new_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar()
     return int(new_id) if new_id else None
 
@@ -224,6 +389,9 @@ def _salary_arrears_has_payments(session: Session, arrears_id: int) -> bool:
     return int(n or 0) > 0
 
 
+_UNSET = object()
+
+
 def upsert_salary_arrears(
     session: Session,
     *,
@@ -233,26 +401,32 @@ def upsert_salary_arrears(
     filter_label: str,
     now: datetime,
     report: PushIntegrityReport,
+    existing_row: Any = _UNSET,
+    has_payments: bool | None = None,
 ) -> None:
     """
     Mirror native payroll generation companion row in ``salary_arrears``.
 
     Preserves ``paid_amount`` when ``salary_arrears_payments`` exist; skips finalized arrears.
+    ``existing_row``/``has_payments`` may be supplied (batch push) to skip per-row reads.
     """
     if not has_table(session, "salary_arrears"):
         return
-    existing = session.execute(
-        text(
-            """
-            SELECT id, paid_amount, balance, finalized
-            FROM salary_arrears
-            WHERE employee_id = :eid AND payroll_date = :pd
-            ORDER BY id ASC
-            LIMIT 1
-            """
-        ),
-        {"eid": employee_id, "pd": payroll_date},
-    ).mappings().first()
+    if existing_row is _UNSET:
+        existing = session.execute(
+            text(
+                """
+                SELECT id, paid_amount, balance, finalized
+                FROM salary_arrears
+                WHERE employee_id = :eid AND payroll_date = :pd
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ),
+            {"eid": employee_id, "pd": payroll_date},
+        ).mappings().first()
+    else:
+        existing = existing_row
 
     net_r = round(float(net_pay), 2)
     flt = filter_label[:255] if len(filter_label) > 255 else filter_label
@@ -263,7 +437,8 @@ def upsert_salary_arrears(
             return
         aid = int(existing["id"])
         paid = float(existing.get("paid_amount") or 0)
-        if _salary_arrears_has_payments(session, aid):
+        has_pay = has_payments if has_payments is not None else _salary_arrears_has_payments(session, aid)
+        if has_pay:
             balance = round(max(0.0, net_r - paid), 2)
             session.execute(
                 text(

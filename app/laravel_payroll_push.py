@@ -11,14 +11,19 @@ from sqlalchemy.orm import Session
 
 from app.models import PayrollImportRun, PayrollImportSnapshot
 from app.payroll_format import _filter_value, _krap9_row_from_payroll_kra_json
+from sqlalchemy import bindparam
+
 from app.payroll_integrity import (
+    PayrollRowState,
     PushIntegrityReport,
-    fetch_employee_for_payroll,
+    fetch_employees_for_payroll,
     has_table,
-    load_payroll_row_state,
+    load_payroll_states,
+    load_salary_arrears_states,
     reflect_krap9_table,
     reflect_payrolls_table,
     remove_duplicate_payrolls,
+    salary_arrears_ids_with_payments,
     upsert_payroll_row,
     upsert_salary_arrears,
 )
@@ -73,15 +78,40 @@ def push_snapshots_to_laravel_payrolls(
     report = PushIntegrityReport()
     written = 0
 
+    # Batch-load everything the per-row loop needs (one query each) instead of
+    # ~7 round-trips per employee — the dominant cost for ~900-row imports.
+    emp_ids = [int(s.employee_id) for s in snaps]
+    employees = fetch_employees_for_payroll(session, emp_ids)
+    states = load_payroll_states(session, emp_ids, payroll_date)
+    arrears_states = load_salary_arrears_states(session, emp_ids, payroll_date)
+    arrears_with_payments = salary_arrears_ids_with_payments(
+        session, [int(a["id"]) for a in arrears_states.values()]
+    )
+
+    # Delete krap9 once for the rows we will (re)write — never touch finalized/missing.
+    writable_ids = [
+        eid for eid in emp_ids
+        if employees.get(eid) and not states.get(eid, PayrollRowState()).must_skip
+    ]
+    if krap9_table is not None and writable_ids:
+        session.execute(
+            text("DELETE FROM krap9 WHERE for_month = :pd AND employee_id IN :ids").bindparams(
+                bindparam("ids", expanding=True)
+            ),
+            {"pd": payroll_date, "ids": writable_ids},
+        )
+
+    krap9_rows: list[dict[str, Any]] = []
     for snap in snaps:
-        employee = fetch_employee_for_payroll(session, int(snap.employee_id))
+        eid = int(snap.employee_id)
+        employee = employees.get(eid)
         if not employee:
-            report.skipped_missing_employee.append(int(snap.employee_id))
+            report.skipped_missing_employee.append(eid)
             continue
 
-        state = load_payroll_row_state(session, int(snap.employee_id), payroll_date)
+        state = states.get(eid) or PayrollRowState()
         if state.must_skip:
-            report.skipped_finalized.append(int(snap.employee_id))
+            report.skipped_finalized.append(eid)
             continue
 
         remove_duplicate_payrolls(session, state, report)
@@ -104,28 +134,31 @@ def push_snapshots_to_laravel_payrolls(
             payload=payload,
             state=state,
             now=now,
+            return_id=False,
         )
 
+        arr = arrears_states.get(eid)
         upsert_salary_arrears(
             session,
-            employee_id=int(snap.employee_id),
+            employee_id=eid,
             payroll_date=payroll_date,
             net_pay=float(payload.get("net_pay") or 0),
             filter_label=flt,
             now=now,
             report=report,
+            existing_row=arr,
+            has_payments=bool(arr) and int(arr["id"]) in arrears_with_payments,
         )
 
         kra_json = str(payload.get("kra") or "")
         if krap9_table is not None and kra_json:
-            session.execute(
-                text("DELETE FROM krap9 WHERE employee_id = :eid AND for_month = :pd"),
-                {"eid": int(snap.employee_id), "pd": payroll_date},
-            )
-            k9_row = _krap9_row_from_payroll_kra_json(kra_json, created_at=now, krap9_table=krap9_table)
-            session.execute(insert(krap9_table).values(**k9_row))
+            krap9_rows.append(_krap9_row_from_payroll_kra_json(kra_json, created_at=now, krap9_table=krap9_table))
 
         written += 1
+
+    # One executemany bulk insert for all P9 rows.
+    if krap9_table is not None and krap9_rows:
+        session.execute(insert(krap9_table), krap9_rows)
 
     if written == 0 and (report.skipped_finalized or report.skipped_missing_employee):
         parts: list[str] = []

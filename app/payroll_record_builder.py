@@ -16,6 +16,8 @@ from app.payroll_format import (
     _costing_report_from_deductions,
     _earnings_bucket_totals,
     _fetch_prescribed_loan_rate,
+    _is_pension_line,
+    _is_voluntary_nssf_line,
     _laravel_deductions_column,
     _non_cash_int,
     _paye_slip_object,
@@ -157,6 +159,25 @@ def build_payroll_record(
     computed = _as_dict(snap.computed)
     earnings, deductions, computed = normalize_snapshot_lines(earnings, deductions, computed)
 
+    # Voluntary NSSF (own statutory column) and pension/retirement (Tier III) — handled
+    # like the native payroll: voluntary reduces taxable pay, pension feeds P9 relief.
+    voluntary_nssf_amt = round(
+        sum(float(x.get("amount") or 0) for x in deductions if _is_voluntary_nssf_line(x)), 2
+    )
+    pension_from_lines = round(
+        sum(
+            float(x.get("amount") or 0)
+            for x in deductions
+            if _is_pension_line(x) and not _is_voluntary_nssf_line(x)
+        ),
+        2,
+    )
+    # CSV is source of truth: prefer pension summed from imported lines (e.g. NSSF
+    # Tier III), falling back to the employee master's retirement contribution.
+    pension_contribution = pension_from_lines if pension_from_lines > 0 else float(
+        employee.get("retirement_contribution") or 0
+    )
+
     basic = _basic_from_earnings(earnings)
     gross = _computed_lookup(computed, "GROSS AMOUNT", "GROSS PAY", "GROSS")
     net = _computed_lookup(computed, "NETTPAY", "NET PAY", "NET SALARY", "NET", "NETPAY")
@@ -189,6 +210,8 @@ def build_payroll_record(
         earnings_lines=earnings,
         deduction_lines=deductions,
         computed=computed,
+        voluntary_nssf=voluntary_nssf_amt,
+        pension_contribution=pension_contribution,
     )
 
     if net <= 0:
@@ -216,13 +239,6 @@ def build_payroll_record(
 
     total_deductions_val = _resolve_total_deductions(computed, gross, net, stat, deductions, paye_due)
     bucket = _earnings_bucket_totals(earnings)
-
-    pension_contribution = float(employee.get("retirement_contribution") or 0)
-    if pension_contribution <= 0:
-        for line in deductions:
-            if str(line.get("name") or line.get("label") or "").strip() == "Retirement Contribution":
-                pension_contribution = float(line.get("amount") or 0)
-                break
 
     mortgage_relief = float(employee.get("mortgage_relief") or 0)
     deductions_rows = json.loads(
@@ -288,6 +304,8 @@ def build_payroll_record(
         payload["nhif_data"] = None
     if _has("nssf"):
         payload["nssf"] = round(nssf_amt, 2) if nssf_amt > 0 else None
+    if _has("voluntary_nssf"):
+        payload["voluntary_nssf"] = voluntary_nssf_amt
     if _has("nssf_data") and nssf_amt > 0:
         payload["nssf_data"] = json.dumps(nssf_data_obj, default=str)
     if _has("personal_relief"):

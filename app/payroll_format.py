@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
-from app.header_utils import normalize_header
+from app.header_utils import canonical_header, normalize_header
 
 
 def _as_list(val: Any) -> list[dict[str, Any]]:
@@ -40,13 +40,46 @@ def _as_dict(val: Any) -> dict[str, Any]:
     return {}
 
 
+# Monthly cap on the allowable retirement-contribution deduction from taxable pay.
+# Mirrors Laravel's config/payroll_config.json -> paye.pension_deduction_cap (KES 30,000).
+DEFAULT_PENSION_DEDUCTION_CAP_KES = 30000.0
+
+
+def allocate_pension_relief(
+    statutory_nssf: float,
+    voluntary_nssf: float,
+    pension_contribution: float,
+    cap: float = DEFAULT_PENSION_DEDUCTION_CAP_KES,
+) -> dict[str, float]:
+    """Split the monthly pension-deduction cap across statutory NSSF, voluntary NSSF,
+    then pension — same order/behaviour as PayrollConfigService::allocatePensionRelief.
+    """
+    remaining = float(cap)
+    statutory_relief = min(max(0.0, statutory_nssf), remaining)
+    remaining -= statutory_relief
+    voluntary_relief = min(max(0.0, voluntary_nssf), remaining)
+    remaining -= voluntary_relief
+    pension_relief = min(max(0.0, pension_contribution), remaining)
+    return {
+        "statutory_relief": round(statutory_relief, 2),
+        "voluntary_relief": round(voluntary_relief, 2),
+        "pension_relief": round(pension_relief, 2),
+        "total_relief": round(statutory_relief + voluntary_relief + pension_relief, 2),
+    }
+
+
 def _computed_lookup(computed: dict[str, Any], *candidates: str) -> float:
-    """Match CSV computed keys case/spacing insensitively."""
+    """Match CSV computed keys case/spacing insensitively.
+
+    Uses ``canonical_header`` so vendor labels fold to statutory tokens
+    (e.g. ``Social Health Ins ACT`` -> ``SHIF``, ``EE NSSF Tier I Contri`` ->
+    ``NSSF TIER 1``, ``Housing Levy`` -> ``AFFORDABLE HOUSING LEVY``).
+    """
     if not computed:
         return 0.0
-    norm_map = {normalize_header(k): float(v or 0) for k, v in computed.items()}
+    norm_map = {canonical_header(k): float(v or 0) for k, v in computed.items()}
     for c in candidates:
-        nk = normalize_header(c)
+        nk = canonical_header(c)
         if nk in norm_map:
             return float(norm_map[nk])
     return 0.0
@@ -54,6 +87,14 @@ def _computed_lookup(computed: dict[str, Any], *candidates: str) -> float:
 
 def _line_label_norm(line: dict[str, Any]) -> str:
     return normalize_header(str(line.get("label") or line.get("name") or ""))
+
+
+def _line_label_canon(line: dict[str, Any]) -> str:
+    return canonical_header(str(line.get("label") or line.get("name") or ""))
+
+
+def _is_voluntary_nssf_line(line: dict[str, Any]) -> bool:
+    return _line_label_canon(line) == "VOLUNTARY NSSF"
 
 
 def _is_basic_line(line: dict[str, Any]) -> bool:
@@ -75,6 +116,9 @@ def _is_pension_line(line: dict[str, Any]) -> bool:
     label = _line_label_norm(line)
     if "RELIEF" in label:
         return False
+    # Tier III folds to RETIREMENT CONTRIBUTION via canonical_header.
+    if _line_label_canon(line) == "RETIREMENT CONTRIBUTION":
+        return True
     return label in ("PENSION", "RETIREMENT CONTRIBUTION") or "PENSION" in label
 
 
@@ -499,12 +543,25 @@ def _paye_slip_object_minimal(paye_due: float) -> dict[str, Any]:
     }
 
 
-def _untaxable_lines_from_statutory(stat: dict[str, Any]) -> list[dict[str, Any]]:
-    """``payslip.untaxable`` — same names/order as ``PayrollCalculatorDynamic::calculatePayslip``."""
+def _untaxable_lines_from_statutory(
+    stat: dict[str, Any],
+    *,
+    voluntary_nssf: float = 0.0,
+    pension_contribution: float = 0.0,
+    pension_cap: float = DEFAULT_PENSION_DEDUCTION_CAP_KES,
+) -> list[dict[str, Any]]:
+    """``payslip.untaxable`` — same names/order as ``PayrollCalculatorDynamic::calculatePayslip``.
+
+    NSSF, voluntary NSSF and pension carry a ``deducted_amount`` = the relief actually
+    allowed after the shared monthly cap; SHIF/AHL/NHIF reduce taxable pay in full.
+    """
     items: list[dict[str, Any]] = []
     nssf = float(stat.get("nssf") or 0)
+    relief = allocate_pension_relief(nssf, voluntary_nssf, pension_contribution, pension_cap)
     if nssf > 0:
-        items.append({"name": "NSSF", "amount": round(nssf, 2), "add": False})
+        items.append(
+            {"name": "NSSF", "amount": round(nssf, 2), "deducted_amount": relief["statutory_relief"], "add": False}
+        )
     shif = float(stat.get("shif") or 0)
     if shif > 0:
         items.append({"name": "SHIF", "amount": round(shif, 2), "add": False})
@@ -514,6 +571,24 @@ def _untaxable_lines_from_statutory(stat: dict[str, Any]) -> list[dict[str, Any]
     nhif = float(stat.get("nhif") or 0)
     if nhif > 0:
         items.append({"name": "NHIF", "amount": round(nhif, 2), "add": False})
+    if voluntary_nssf > 0:
+        items.append(
+            {
+                "name": "Voluntary NSSF",
+                "amount": round(voluntary_nssf, 2),
+                "deducted_amount": relief["voluntary_relief"],
+                "add": False,
+            }
+        )
+    if pension_contribution > 0:
+        items.append(
+            {
+                "name": "Retirement Contribution",
+                "amount": round(pension_contribution, 2),
+                "deducted_amount": relief["pension_relief"],
+                "add": False,
+            }
+        )
     return items
 
 
@@ -699,6 +774,9 @@ def build_laravel_payslip_json(
     earnings_lines: list[dict[str, Any]],
     deduction_lines: list[dict[str, Any]],
     computed: dict[str, Any],
+    voluntary_nssf: float = 0.0,
+    pension_contribution: float = 0.0,
+    pension_cap: float = DEFAULT_PENSION_DEDUCTION_CAP_KES,
 ) -> dict[str, Any]:
     """Payslip JSON compatible with Laravel payslip blade (statutory + variable deductions)."""
     stat = statutory
@@ -769,14 +847,29 @@ def build_laravel_payslip_json(
     start = payroll_month_end.replace(day=1)
     date_str = f"{start.strftime('%b %d, %Y')} - {payroll_month_end.strftime('%b %d, %Y')}"
 
-    taxable = _computed_lookup(computed, "TAXABLE PAY", "TAXABLE")
-    if taxable <= 0:
-        taxable = gross if gross > 0 else basic_slip + sum(float(x.get("amount") or 0) for x in allowances_slip)
-
     total_allow = round(sum(float(x.get("amount") or 0) for x in allowances_slip), 2)
     total_ded = _resolve_total_deductions(computed, gross, net, stat, deduction_lines, paye_due)
 
-    untaxable_items = _untaxable_lines_from_statutory(stat)
+    # Non-tax (pension-relief) block, same names/order as native ``calculatePayslip``:
+    # statutory NSSF/SHIF/AHL, then voluntary NSSF and pension/retirement. NSSF +
+    # voluntary + pension share the monthly deduction cap; each item's relief is its
+    # ``deducted_amount`` (falls back to full amount for SHIF/AHL/NHIF).
+    untaxable_items = _untaxable_lines_from_statutory(
+        stat,
+        voluntary_nssf=voluntary_nssf,
+        pension_contribution=pension_contribution,
+        pension_cap=pension_cap,
+    )
+    total_non_tax = round(
+        sum(float(x.get("deducted_amount", x.get("amount")) or 0) for x in untaxable_items), 2
+    )
+
+    # Taxable pay = CSV value when present, else gross less the (capped) non-tax block
+    # (matches native payslip: taxable_pay = gross - total_non_tax).
+    taxable = _computed_lookup(computed, "TAXABLE PAY", "TAXABLE")
+    if taxable <= 0:
+        base = gross if gross > 0 else basic_slip + total_allow
+        taxable = max(0.0, round(base - total_non_tax, 2))
 
     net_rounded = round(net, 2) if net else round(
         gross - total_ded if gross else basic_slip + total_allow - total_ded,
@@ -800,7 +893,7 @@ def build_laravel_payslip_json(
         "total_deductions": total_ded,
         "paye_due": round(paye_due, 2),
         "leave_days": 0,
-        "total_non_tax": round(sum(float(x.get("amount") or 0) for x in untaxable_items), 2),
+        "total_non_tax": total_non_tax,
         "other_benefits": "TBD",
         "untaxable": json.dumps(untaxable_items),
         "allowances": json.dumps(allowances_slip),

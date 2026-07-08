@@ -3,20 +3,18 @@
 from __future__ import annotations
 
 import calendar
-import csv
 import hashlib
-import io
+import json
 import re
+from collections import Counter
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.orm import Session
 
 from app.models import (
-    Allowance,
-    Deduction,
     PayrollImportColumnMap,
     PayrollImportRawRow,
     PayrollImportRun,
@@ -25,7 +23,10 @@ from app.models import (
 from app.payroll_masters import enrich_deduction_line, enrich_earning_line, load_master_context
 
 
+from app.classification import load_classification_sections
 from app.header_utils import normalize_header
+from app.master_match import MasterIndex, load_master_index, match_deduction, match_earning
+from app.tabular_parse import parse_table
 
 
 PAYROLL_NO_KEY = normalize_header("PAYROLL NO")
@@ -148,6 +149,96 @@ def _merge_money_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(merged.values())
 
 
+def _stage_rows(parsed_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Number the parsed rows and collect their payroll numbers."""
+    rows: list[dict[str, Any]] = []
+    payroll_numbers: list[str] = []
+    for i, payload in enumerate(parsed_rows, start=1):
+        rows.append({"row_no": i, "payload": payload})
+        pn = str(payload.get(PAYROLL_NO_KEY, "")).strip()
+        if pn:
+            payroll_numbers.append(pn)
+    return rows, payroll_numbers
+
+
+def _build_import_warnings(missing: list[str], duplicates: list[str]) -> dict[str, Any] | None:
+    warnings: dict[str, Any] = {}
+    if missing:
+        warnings["missing_payroll_numbers"] = {
+            "count": len(missing),
+            "sample": missing[:50],
+            "message": (
+                f"{len(missing)} payroll number(s) not found in employees — "
+                "those rows are skipped when building snapshots / pushing payroll."
+            ),
+        }
+    if duplicates:
+        warnings["duplicate_payroll_numbers_merged_into_one_snapshot"] = duplicates
+    return {"import_warnings": warnings} if warnings else None
+
+
+def _overtime_rate_bucket(label: str) -> int:
+    """Classify an overtime line as tier 1 (1.5x) or tier 2 (2x); 0 = unknown."""
+    n = normalize_header(label)
+    if any(t in n for t in ("2.0", "2.5", "@ 2", "X 2", "OT 2", "OT2", "DOUBLE")):
+        return 2
+    if any(t in n for t in ("1.5", "@ 1.5", "OT 1", "OT1", "HALF", "TIME AND A")):
+        return 1
+    return 0
+
+
+def _merge_by_master(
+    lines: list[dict[str, Any]],
+    masters: Any,
+    id_key: str,
+) -> list[dict[str, Any]]:
+    """Collapse earning/deduction lines that link to the *same* master into one entry.
+
+    Native allowance/deduction reports list one row per master and match by name, so
+    split columns (e.g. Overtime @1.5 + Overtime @2.0 -> one ``Overtime`` master) must
+    become a single entry named after the master, or the report under-counts. A
+    ``detailed`` breakdown is preserved; overtime also carries ``OT1``/``OT2``.
+    """
+    passthrough: list[dict[str, Any]] = []
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for ln in lines:
+        mid = ln.get(id_key)
+        if mid is None:
+            passthrough.append(ln)
+        else:
+            groups.setdefault(int(mid), []).append(ln)
+
+    is_allow = id_key == "allowance_id"
+    by_id = masters.allowances_by_id if is_allow else masters.deductions_by_id
+
+    merged: list[dict[str, Any]] = []
+    for mid, grp in groups.items():
+        meta = by_id.get(mid)
+        name = meta.name if meta else (grp[0].get("name") or grp[0].get("label") or "")
+        labels = [str(x.get("label") or x.get("name") or "") for x in grp]
+        total = round(sum(float(x.get("amount") or 0) for x in grp), 2)
+        # Normalize every linked line to the master name so reports match by name.
+        base = dict(grp[0])
+        base["name"] = name
+        base["label"] = name
+        base["amount"] = total
+        if len(grp) > 1:
+            base["detailed"] = json.dumps(
+                [{"name": lbl, "amount": round(float(x.get("amount") or 0), 2)} for lbl, x in zip(labels, grp)]
+            )
+        if is_allow:
+            base["tax_amount"] = total if base.get("taxable", 1) else 0.0
+            if "OVERTIME" in normalize_header(name) or any("OVERTIME" in normalize_header(x) for x in labels):
+                base["OT1"] = round(
+                    sum(float(x.get("amount") or 0) for x, lbl in zip(grp, labels) if _overtime_rate_bucket(lbl) == 1), 2
+                )
+                base["OT2"] = round(
+                    sum(float(x.get("amount") or 0) for x, lbl in zip(grp, labels) if _overtime_rate_bucket(lbl) == 2), 2
+                )
+        merged.append(base)
+    return passthrough + merged
+
+
 def ingest_csv(
     session: Session,
     *,
@@ -155,12 +246,16 @@ def ingest_csv(
     file_content: bytes,
     original_filename: str,
 ) -> PayrollImportRun:
-    """Create run, parse CSV into raw_rows, validate employees exist."""
+    """Create run, parse CSV/XLSX into raw_rows, validate employees exist.
+
+    Missing payroll numbers no longer fail the whole run: matched employees are
+    imported and the unmatched ones are recorded as a warning. The run only fails
+    when *no* payroll number matches an employee (nothing usable to import).
+    """
     sha = hashlib.sha256(file_content).hexdigest()
-    text = file_content.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        raise ValueError("CSV has no header row")
+    parsed = parse_table(file_content, original_filename)
+    if not parsed.rows:
+        raise ValueError("No data rows found in file")
 
     run = PayrollImportRun(
         payroll_month=payroll_month,
@@ -173,55 +268,29 @@ def ingest_csv(
     session.add(run)
     session.flush()
 
-    rows: list[dict[str, Any]] = []
-    payroll_numbers: list[str] = []
-    for i, row in enumerate(reader, start=1):
-        payload: dict[str, Any] = {}
-        for k, v in row.items():
-            if k is None:
-                continue
-            nk = normalize_header(k)
-            if isinstance(v, str):
-                payload[nk] = v.strip()
-            else:
-                payload[nk] = v
-        rows.append({"row_no": i, "payload": payload})
-        pn = str(payload.get(PAYROLL_NO_KEY, "")).strip()
-        if pn:
-            payroll_numbers.append(pn)
-
+    rows, payroll_numbers = _stage_rows(parsed.rows)
     unique_pn = sorted(set(payroll_numbers))
-    from collections import Counter
-
     pn_counts = Counter(payroll_numbers)
     duplicate_payroll_numbers = sorted([p for p, c in pn_counts.items() if c > 1])
     missing = _find_missing_payroll_numbers(session, unique_pn)
-    if missing:
+
+    if not unique_pn or len(missing) >= len(unique_pn):
         run.status = "failed"
         run.error_json = {"missing_payroll_numbers": missing}
         run.row_count = 0
         session.flush()
         return run
 
-    for item in rows:
-        session.add(
-            PayrollImportRawRow(
-                import_run_id=run.id,
-                row_no=item["row_no"],
-                payload=item["payload"],
-            )
+    if rows:
+        session.execute(
+            insert(PayrollImportRawRow),
+            [{"import_run_id": run.id, "row_no": item["row_no"], "payload": item["payload"]} for item in rows],
         )
     run.row_count = len(rows)
     run.status = "parsed"
-    if duplicate_payroll_numbers:
-        run.error_json = {
-            "import_warnings": {
-                "duplicate_payroll_numbers_merged_into_one_snapshot": duplicate_payroll_numbers,
-                "message": "Multiple CSV rows for the same payroll number were merged for this import run.",
-            }
-        }
+    run.error_json = _build_import_warnings(missing, duplicate_payroll_numbers)
     session.flush()
-    rebuild_column_maps(session, run.id)
+    rebuild_column_maps(session, run.id, raw_labels=parsed.raw_headers, sections=parsed.sections)
     return run
 
 
@@ -243,37 +312,18 @@ def replace_run_csv(
         raise ValueError("Run not found")
 
     sha = hashlib.sha256(file_content).hexdigest()
-    raw_text = file_content.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(raw_text))
-    if not reader.fieldnames:
-        raise ValueError("CSV has no header row")
+    parsed = parse_table(file_content, original_filename)
+    if not parsed.rows:
+        raise ValueError("No data rows found in file")
 
-    rows: list[dict[str, Any]] = []
-    payroll_numbers: list[str] = []
-    for i, row in enumerate(reader, start=1):
-        payload: dict[str, Any] = {}
-        for k, v in row.items():
-            if k is None:
-                continue
-            nk = normalize_header(k)
-            if isinstance(v, str):
-                payload[nk] = v.strip()
-            else:
-                payload[nk] = v
-        rows.append({"row_no": i, "payload": payload})
-        pn = str(payload.get(PAYROLL_NO_KEY, "")).strip()
-        if pn:
-            payroll_numbers.append(pn)
-
+    rows, payroll_numbers = _stage_rows(parsed.rows)
     unique_pn = sorted(set(payroll_numbers))
-    from collections import Counter
-
     pn_counts = Counter(payroll_numbers)
     duplicate_payroll_numbers = sorted([p for p, c in pn_counts.items() if c > 1])
     missing = _find_missing_payroll_numbers(session, unique_pn)
-    if missing:
+    if not unique_pn or len(missing) >= len(unique_pn):
         raise ValueError(
-            "New CSV is not applied — payroll numbers missing in employees: "
+            "New file is not applied — no payroll number matches an employee. Missing: "
             + ", ".join(missing[:50])
             + (" …" if len(missing) > 50 else "")
         )
@@ -283,26 +333,16 @@ def replace_run_csv(
 
     run.csv_sha256 = sha
     run.original_filename = original_filename[:500]
-    run.error_json = None
-    for item in rows:
-        session.add(
-            PayrollImportRawRow(
-                import_run_id=run.id,
-                row_no=item["row_no"],
-                payload=item["payload"],
-            )
+    if rows:
+        session.execute(
+            insert(PayrollImportRawRow),
+            [{"import_run_id": run.id, "row_no": item["row_no"], "payload": item["payload"]} for item in rows],
         )
     run.row_count = len(rows)
     run.status = "parsed"
-    if duplicate_payroll_numbers:
-        run.error_json = {
-            "import_warnings": {
-                "duplicate_payroll_numbers_merged_into_one_snapshot": duplicate_payroll_numbers,
-                "message": "Multiple CSV rows for the same payroll number were merged for this import run.",
-            }
-        }
+    run.error_json = _build_import_warnings(missing, duplicate_payroll_numbers)
     session.flush()
-    rebuild_column_maps(session, run.id)
+    rebuild_column_maps(session, run.id, raw_labels=parsed.raw_headers, sections=parsed.sections)
     return run
 
 
@@ -318,8 +358,26 @@ def _find_missing_payroll_numbers(session: Session, payroll_numbers: list[str]) 
     return [p for p in payroll_numbers if p not in found]
 
 
-def rebuild_column_maps(session: Session, run_id: int) -> int:
-    """Replace column maps with auto-suggestions."""
+def rebuild_column_maps(
+    session: Session,
+    run_id: int,
+    raw_labels: dict[str, str] | None = None,
+    sections: dict[str, str] | None = None,
+) -> int:
+    """Replace column maps with auto-suggestions.
+
+    ``raw_labels`` maps a canonical header to its original display label; ``sections``
+    maps a canonical header to a banner section hint ("earning" / "statutory" /
+    "other_deduction" / "memo"). Both are supplied by the parser on import. On a
+    standalone rebuild they default to the labels already stored on existing maps.
+    """
+    # Preserve existing display labels (and reuse them) across a manual rebuild.
+    existing_labels: dict[str, str] = {
+        m.csv_header_normalized: m.csv_header_raw
+        for m in session.scalars(
+            select(PayrollImportColumnMap).where(PayrollImportColumnMap.import_run_id == run_id)
+        )
+    }
     session.execute(delete(PayrollImportColumnMap).where(PayrollImportColumnMap.import_run_id == run_id))
 
     keys: set[str] = set()
@@ -328,44 +386,78 @@ def rebuild_column_maps(session: Session, run_id: int) -> int:
     ):
         keys.update(payload.keys())
 
-    allowances = {normalize_header(a.name): a.id for a in session.scalars(select(Allowance))}
-    deductions = {normalize_header(d.name): d.id for d in session.scalars(select(Deduction))}
+    master_idx = load_master_index(session)
+    classification = load_classification_sections(session)
 
-    # raw header display: take from first row occurrence
-    raw_label: dict[str, str] = {}
-    for (payload,) in session.execute(
-        select(PayrollImportRawRow.payload).where(PayrollImportRawRow.import_run_id == run_id).limit(1)
-    ):
-        # DictReader keys were normalized; use normalized as display unless we stored raw - we only have normalized keys
-        for k in payload:
-            raw_label[k] = k.replace(" ", " ").title()
+    raw_label = dict(existing_labels)
+    if raw_labels:
+        raw_label.update(raw_labels)
+    sect = dict(sections or {})
+
+    # Rename voluntary/pension lines to the native payroll names so payslips, the
+    # payrolls.deductions column and P9 reports read consistently.
+    _native_names = {"voluntary_nssf": "Voluntary NSSF", "pension": "Retirement Contribution"}
 
     count = 0
+    unclassified_money: list[str] = []
     for norm in sorted(keys):
-        role, match_type, aid, did, conf = _classify_header(norm, allowances, deductions)
+        role, match_type, aid, did, conf = _classify_header(
+            norm, master_idx, sect.get(norm, ""), classification.get(norm, "")
+        )
+        # Flag only money columns whose role was *guessed* (banner section / keyword),
+        # not those routed by the sheet, a master link, or an explicit statutory rule.
+        if (
+            classification
+            and role in ("earning", "deduction")
+            and match_type in ("section", "unresolved")
+            and norm not in classification
+        ):
+            unclassified_money.append(raw_label.get(norm) or norm)
         session.add(
             PayrollImportColumnMap(
                 import_run_id=run_id,
-                csv_header_raw=raw_label.get(norm, norm),
+                csv_header_raw=raw_label.get(norm) or norm.title(),
                 csv_header_normalized=norm,
                 role=role,
                 match_type=match_type,
                 allowance_id=aid,
                 deduction_id=did,
-                display_label_override=None,
+                display_label_override=_native_names.get(match_type),
                 loan_match_rule=None,
                 confidence=conf,
             )
         )
         count += 1
+
+    # Record columns the classification sheet doesn't list (guessed as money) so the
+    # operator can add them to the sheet rather than have them silently included.
+    if unclassified_money:
+        run = session.get(PayrollImportRun, run_id)
+        if run is not None:
+            ej = dict(run.error_json or {})
+            warnings = dict(ej.get("import_warnings") or {})
+            warnings["unclassified_columns"] = {
+                "count": len(unclassified_money),
+                "columns": sorted(set(unclassified_money))[:50],
+                "message": "These columns are not in the classification sheet; roles were guessed.",
+            }
+            ej["import_warnings"] = warnings
+            run.error_json = ej
+
     session.flush()
     return count
 
 
+_DEDUCTION_KEYWORDS = ("DEDUCTION", "LOAN", "SACCO", "RECOVERY", "HELB", "ADVANCE", "IMREST", "IMPREST")
+# Unlisted check / variance columns (e.g. "Variance (chk)") are informational, not money.
+_INFORMATIONAL_HINTS = ("VARIANCE", "CHK", "CHECK")
+
+
 def _classify_header(
     norm: str,
-    allowances: dict[str, int],
-    deductions: dict[str, int],
+    master_idx: MasterIndex,
+    section: str = "",
+    classification_section: str = "",
 ) -> tuple[str, str, int | None, int | None, float | None]:
     if norm in DEFAULT_DIMENSION:
         return "dimension", "fixed", None, None, 1.0
@@ -375,17 +467,67 @@ def _classify_header(
         return "computed", "heuristic", None, None, 0.95
     if norm in ("NSSF 1", "NSSF 2") or "NSSF TIER" in norm:
         return "computed", "heuristic", None, None, 0.95
+    # Voluntary NSSF and pension/retirement are deductions handled like the native
+    # payroll (own voluntary_nssf column / pension relief on P9).
+    if norm == "VOLUNTARY NSSF":
+        return "deduction", "voluntary_nssf", None, None, 1.0
+    if norm == "RETIREMENT CONTRIBUTION":
+        return "deduction", "pension", None, None, 1.0
     if norm in ("PAYE DUE",):
         return "computed", "heuristic", None, None, 0.9
+    # Sub-totals / check columns (e.g. TOTAL STATUTORY, TOTAL OTHER DED.) are informational —
+    # keep them out of earnings/deductions so they don't double-count.
+    if norm.startswith("TOTAL"):
+        return "dimension", "informational", None, None, 0.6
     if "PENSION" in norm and "RELIEF" not in norm:
-        return "deduction", "heuristic", None, None, 0.85
-    if norm in allowances:
-        return "earning", "auto_allowance", allowances[norm], None, 1.0
-    if norm in deductions:
-        return "deduction", "auto_deduction", None, deductions[norm], 1.0
+        # Link to a deduction master when one exists, else stay a heuristic pension line.
+        did = match_deduction(norm, master_idx)
+        return "deduction", "auto_deduction" if did else "heuristic", None, did, 1.0 if did else 0.85
+
+    # Authoritative: the tenant classification sheet decides the role for listed columns.
+    cs = classification_section
+    if cs == "EARNING":
+        aid = match_earning(norm, master_idx)
+        return "earning", "classification_allowance" if aid else "classification", aid, None, 1.0 if aid else 0.9
+    if cs == "OTHER DEDUCTION":
+        did = match_deduction(norm, master_idx)
+        return "deduction", "classification_deduction" if did else "classification", None, did, 1.0 if did else 0.9
+    if cs == "STATUTORY DEDUCTION":
+        return "computed", "classification", None, None, 0.9
+    if cs in ("MEMO", "CALCULATED"):
+        return "dimension", "classification_informational", None, None, 0.9
+
+    # Unlisted variance / check columns are informational, never money.
+    if any(h in norm for h in _INFORMATIONAL_HINTS):
+        return "dimension", "informational", None, None, 0.6
+
+    # Link special/fixed earning & deduction columns to existing (non-statutory) masters.
+    # Try the type the column leans toward first so a shared word can't cross-link.
+    lean_deduction = section in ("statutory", "other_deduction") or any(k in norm for k in _DEDUCTION_KEYWORDS)
+    if lean_deduction and section != "earning":
+        did = match_deduction(norm, master_idx)
+        if did is not None:
+            return "deduction", "auto_deduction", None, did, 1.0
+        aid = match_earning(norm, master_idx)
+        if aid is not None:
+            return "earning", "auto_allowance", aid, None, 1.0
+    else:
+        aid = match_earning(norm, master_idx)
+        if aid is not None:
+            return "earning", "auto_allowance", aid, None, 1.0
+        did = match_deduction(norm, master_idx)
+        if did is not None:
+            return "deduction", "auto_deduction", None, did, 1.0
+
+    # Banner section from the spreadsheet (EARNINGS / STATUTORY / OTHER DEDUCTIONS / MEMO).
+    if section == "memo":
+        return "dimension", "section", None, None, 0.6
+    if section in ("statutory", "other_deduction"):
+        return "deduction", "section", None, None, 0.6
+    if section == "earning":
+        return "earning", "section", None, None, 0.6
     # Heuristic for loan-like / deduction-like labels
-    blob = norm
-    if any(x in blob for x in ("DEDUCTION", "LOAN", "SACCO", "RECOVERY", "HELB", "ADVANCE", "IMREST", "IMPREST")):
+    if any(x in norm for x in _DEDUCTION_KEYWORDS):
         return "deduction", "unresolved", None, None, 0.4
     return "earning", "unresolved", None, None, 0.4
 
@@ -522,10 +664,14 @@ def build_snapshots(
             bucket["computed"][k] = float(bucket["computed"].get(k, 0)) + float(v)
         bucket["dimensions"].update(dimensions)
 
-    n = 0
+    snap_rows: list[dict[str, Any]] = []
     for eid, bucket in by_eid.items():
         earnings = [enrich_earning_line(x, masters) for x in _merge_money_lines(bucket["earnings"])]
         deductions = [enrich_deduction_line(x, masters) for x in _merge_money_lines(bucket["deductions"])]
+        # One entry per master so native allowance/deduction reports (which list one row
+        # per master and keep the last name-match) count split columns correctly.
+        earnings = _merge_by_master(earnings, masters, "allowance_id")
+        deductions = _merge_by_master(deductions, masters, "deduction_id")
         comp = dict(bucket["computed"])
         comp[SNAPSHOT_PERSONAL_RELIEF_LABEL] = float(personal_relief_kes)
         norm_map = {normalize_header(k): float(v or 0) for k, v in comp.items()}
@@ -533,17 +679,19 @@ def build_snapshots(
         if tr <= 0 and float(personal_relief_kes) > 0:
             comp["Total Relief"] = float(personal_relief_kes)
         dim = bucket["dimensions"]
-        session.add(
-            PayrollImportSnapshot(
-                import_run_id=run_id,
-                employee_id=eid,
-                earnings_lines=earnings,
-                deduction_lines=deductions,
-                computed=comp or None,
-                dimensions=dim or None,
-            )
+        snap_rows.append(
+            {
+                "import_run_id": run_id,
+                "employee_id": eid,
+                "earnings_lines": earnings,
+                "deduction_lines": deductions,
+                "computed": comp or None,
+                "dimensions": dim or None,
+            }
         )
-        n += 1
+    if snap_rows:
+        session.execute(insert(PayrollImportSnapshot), snap_rows)
+    n = len(snap_rows)
 
     run = session.get(PayrollImportRun, run_id)
     if run:

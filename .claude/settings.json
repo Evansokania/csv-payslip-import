@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('paye keys:', list\\(d.get\\('paye',{}\\).keys\\(\\)\\)\\); print\\('pension_deduction_cap:', d.get\\('paye',{}\\).get\\('pension_deduction_cap'\\)\\); print\\('personal_relief:', d.get\\('paye',{}\\).get\\('personal_relief'\\)\\)\")"
+    ]
+  }
+}
