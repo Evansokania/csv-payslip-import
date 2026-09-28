@@ -100,13 +100,13 @@ with `override=True` so the project file wins; if anything still looks wrong, re
    # edit MYSQL_DATABASE to your tenant database name
    python -m venv .venv
    .venv\Scripts\activate
-   pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
 
 3. Run:
 
    ```bash
-   uvicorn app.main:app --host 127.0.0.1 --port 8890 --reload
+   python -m uvicorn app.main:app --host 127.0.0.1 --port 8890 --reload
    ```
 
 4. Open **http://127.0.0.1:8890**
@@ -153,7 +153,7 @@ You can ship a **folder** (onedir) so teammates do not need Python installed.
    ```powershell
    cd C:\laragon\www\csv-payslip-import
    .\.venv\Scripts\activate
-   pip install -r requirements.txt -r requirements-build.txt
+   python -m pip install -r requirements.txt -r requirements-build.txt
    ```
 
 2. Build:
@@ -162,7 +162,7 @@ You can ship a **folder** (onedir) so teammates do not need Python installed.
    .\scripts\build_exe.ps1
    ```
 
-   Or manually: `pyinstaller --noconfirm csv-payslip-import.spec`
+   Or manually: `python -m PyInstaller --noconfirm csv-payslip-import.spec`
 
 3. **Share** the whole `dist\csv-payslip-import\` directory (zip it). The runnable file is
    `csv-payslip-import.exe`.
@@ -192,7 +192,12 @@ MySQL must be reachable from that PC (same rules as the Python app).
   cannot read `payroll_import_runs` (missing table or permissions). Also use `/diag` (no DB). If
   `/diag` is 404, you are not running this repo’s `app.main:app` from `csv-payslip-import` (check
   `/docs` for routes).
-- **`.xlsx` won't parse** — ensure `openpyxl>=3.1.0` is installed (`pip install -r requirements.txt`).
+- **`uvicorn.exe` / `pip.exe` “blocked by your organization's Device Guard policy”** — the
+  launcher shims pip writes into `.venv\Scripts\` are unsigned, so WDAC refuses them. `python.exe`
+  itself is allowed, so call the same tools as modules: `python -m uvicorn app.main:app ...`,
+  `python -m pip install ...`, `python -m PyInstaller ...`. `python -m app` also starts the server
+  on the `.env` host/port. No policy exemption is needed.
+- **`.xlsx` won't parse** — ensure `openpyxl>=3.1.0` is installed (`python -m pip install -r requirements.txt`).
 - **A money column is flagged “unclassified”** — add/adjust its row in the classification sheet and
   re-seed, or fix the mapping on the run's map page before building the snapshot.
 - **Statutory shows 0 on P9/payslip** — confirm the header canonicalizes correctly (synonyms map) so

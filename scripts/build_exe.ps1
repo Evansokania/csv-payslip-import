@@ -5,11 +5,13 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
 
 if (-not (Test-Path .\.venv\Scripts\python.exe)) {
-    Write-Error "Create .venv first: python -m venv .venv && .\.venv\Scripts\pip install -r requirements.txt -r requirements-build.txt"
+    Write-Error "Create .venv first: python -m venv .venv && .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt"
 }
 
-.\.venv\Scripts\pip install -r requirements.txt -r requirements-build.txt
-.\.venv\Scripts\pyinstaller.exe --noconfirm csv-payslip-import.spec
+# Invoke via `python -m`: the pip-generated shims in Scripts\ (pip.exe, pyinstaller.exe)
+# are unsigned and get blocked outright on Device Guard / WDAC machines.
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm csv-payslip-import.spec
 
 # PyInstaller puts `.env.example` inside `_internal`; duplicate beside the .exe for easy setup.
 Copy-Item -Path .\.env.example -Destination .\dist\csv-payslip-import\.env.example -Force
