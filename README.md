@@ -50,7 +50,9 @@ to keep a full month import at a few seconds.
   (`krap9`) rows on push. See [templates/payslip.html](templates/payslip.html).
 - **Integrity-safe push.** Skips **finalized** payrolls, preserves `salary_arrears` `paid_amount` when
   payments exist, removes only *unfinalized* duplicates, and requires `employee_id` to exist in
-  `employees`. See [app/laravel_payroll_push.py](app/laravel_payroll_push.py) +
+  `employees` — **soft-deleted (separated) employees included**, matching Laravel, where
+  `Payroll::employee()` and `KRAP9::employee()` are `withTrashed()`.
+  See [app/laravel_payroll_push.py](app/laravel_payroll_push.py) +
   [app/payroll_integrity.py](app/payroll_integrity.py).
 
 ### Report coverage notes
@@ -62,6 +64,13 @@ to keep a full month import at a few seconds.
   By design it cannot itemize individual named lines — those all appear under `other_allowances` /
   `other_deductions`. A few scalar columns (e.g. `airtime_allowance`, `director_fees`) and
   `costing_report_deductions_total` may read blank/0 for imports unless explicitly mapped/flagged.
+- **Separated staff.** Imported rows for soft-deleted employees are read back by every
+  payroll-rooted report — the payroll report/export, the Company Total report, the statutory files
+  (PAYE, SHIF, NSSF, NITA, FBT, Housing Levy) and P9 — because those all start from `Payroll` /
+  `KRAP9`, whose `employee()` relation is `withTrashed()`. The **EFT bank files are the exception**:
+  `EftReportController`, `DailyEftReportController` and `WeeklyEftReportController` filter
+  `whereNull('employees.deleted_at')` on purpose, so a separated employee is never handed to the bank
+  in the monthly run. Settle them off-cycle instead.
 
 ---
 
@@ -118,7 +127,10 @@ with `override=True` so the project file wins; if anything still looks wrong, re
 1. **Upload** CSV/XLSX + payroll month → creates a `payroll_import_runs` row and parses rows
    (`POST /runs/upload`).
 2. **Parse** validates every `PAYROLL NO` against `employees`. Missing employees are **skipped and
-   reported** (the run only fails if *zero* rows match).
+   reported** (the run only fails if *zero* rows match). **Separated (soft-deleted) employees still
+   import** — a month they earned belongs in that month's cost, P9 and statutory files, so
+   `deleted_at` is not part of the lookup. Only a payroll number with no `employees` row at all is
+   skipped.
 3. **Map columns** — auto-suggested from synonyms + classification + master match; review and adjust
    (`POST /runs/{id}/map/rebuild`, `POST /runs/{id}/map/save`, `POST /runs/{id}/map/ai-suggest`).
    Unclassified money columns are flagged for attention.

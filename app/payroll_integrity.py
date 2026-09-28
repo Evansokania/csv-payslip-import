@@ -65,7 +65,11 @@ def _expand(ids: list[int]):
 
 
 def fetch_employees_for_payroll(session: Session, employee_ids: list[int]) -> dict[int, dict[str, Any]]:
-    """Batch equivalent of :func:`fetch_employee_for_payroll` — 3 queries total, not 3 per row."""
+    """Batch equivalent of :func:`fetch_employee_for_payroll` — 3 queries total, not 3 per row.
+
+    Soft-deleted (separated) employees are resolved like any other: a month they earned
+    still belongs in that month's payroll, P9 and statutory files.
+    """
     ids = sorted({int(i) for i in employee_ids if i is not None})
     if not ids or not has_table(session, "employees"):
         return {}
@@ -77,7 +81,7 @@ def fetch_employees_for_payroll(session: Session, employee_ids: list[int]) -> di
             SELECT id, first_name, last_name, payroll_number, identification_type,
                    identification_number, kra_pin, hr_subdept_id,
                    retirement_contribution, mortgage_relief, relief
-            FROM employees WHERE id IN :ids AND deleted_at IS NULL
+            FROM employees WHERE id IN :ids
             """
         ).bindparams(param),
         {"ids": values},
@@ -219,7 +223,7 @@ def fetch_employee_for_payroll(session: Session, employee_id: int) -> dict[str, 
                    identification_number, kra_pin, hr_subdept_id,
                    retirement_contribution, mortgage_relief, relief
             FROM employees
-            WHERE id = :eid AND deleted_at IS NULL
+            WHERE id = :eid
             LIMIT 1
             """
         ),

@@ -351,8 +351,12 @@ def _find_missing_payroll_numbers(session: Session, payroll_numbers: list[str]) 
         return ["(no payroll numbers in CSV)"]
     from sqlalchemy import bindparam, text
 
+    # Soft-deleted employees count as found. Someone separated after the payroll month
+    # was earned still has to be imported: their pay is part of the month's cost and
+    # their P9 / statutory figures are filed for the year, not for who is still on staff.
+    # Laravel reads them back the same way — Payroll::employee() is withTrashed().
     stmt = text(
-        "SELECT payroll_number FROM employees WHERE payroll_number IN :pns AND deleted_at IS NULL"
+        "SELECT payroll_number FROM employees WHERE payroll_number IN :pns"
     ).bindparams(bindparam("pns", expanding=True))
     found = {r[0] for r in session.execute(stmt, {"pns": payroll_numbers}).fetchall()}
     return [p for p in payroll_numbers if p not in found]
@@ -604,8 +608,12 @@ def build_snapshots(
     if pay_nums:
         from sqlalchemy import bindparam, text
 
+        # Separated employees are snapshotted too — see _find_missing_payroll_numbers.
+        # A rehire can leave one closed and one open row on the same payroll number, so
+        # order the live row last and let it win the assignment.
         stmt = text(
-            "SELECT id, payroll_number FROM employees WHERE payroll_number IN :pns AND deleted_at IS NULL"
+            "SELECT id, payroll_number FROM employees WHERE payroll_number IN :pns "
+            "ORDER BY (deleted_at IS NULL), id"
         ).bindparams(bindparam("pns", expanding=True))
         for rid, pn in session.execute(stmt, {"pns": pay_nums}).fetchall():
             by_pn[str(pn).strip()] = int(rid)
